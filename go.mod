@@ -2,7 +2,10 @@ module github.com/ValentinKolb/etcdBench
 
 go 1.24.1
 
-require go.etcd.io/etcd/client/v3 v3.5.21
+require (
+	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
+	go.etcd.io/etcd/client/v3 v3.5.21
+)
 
 require (
 	github.com/coreos/go-semver v0.3.0 // indirect

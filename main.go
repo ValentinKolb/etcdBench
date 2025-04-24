@@ -5,6 +5,8 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"github.com/rcrowley/go-metrics"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"log"
 	"math"
 	"os"
@@ -12,8 +14,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var (
@@ -23,10 +23,13 @@ var (
 	perfNumThreads       = -1
 	perfKeySpread        = -1
 	perfSkip             = make([]string, 0)
+	perfSampleRate       = 0
 	endpoints            = []string{"localhost:2379", "localhost:2380", "localhost:2381"}
 	csvPath              = ""
 	etcdClient           *clientv3.Client
 	timeout              = 5 * time.Second
+	// Latency histograms for each operation type
+	latencyHistograms = make(map[string]metrics.Histogram)
 )
 
 func init() {
@@ -36,28 +39,50 @@ func init() {
 	flag.IntVar(&perfKeySpread, "keys", 100, "How many different keys to use for the tests")
 	flag.IntVar(&perfNumThreads, "threads", 10, "Number of threads to use for the benchmark")
 	flag.StringVar(&csvPath, "csv", "", "Optional path to save benchmark results as CSV")
-
+	flag.IntVar(&perfSampleRate, "sample-rate", 100, "Sample rate for latency measurements (1 in N operations, 0 to disable)")
 	skipFlag := flag.String("skip", "", "Benchmarks to skip (comma separated - e.g. set,get)")
 	endpointsFlag := flag.String("endpoints", "localhost:2379,localhost:2380,localhost:2381", "etcd endpoints (comma separated)")
 	timeoutFlag := flag.Int("timeout", 5, "etcd operation timeout in seconds")
-
 	flag.Parse()
 
 	// Process flags
 	if *skipFlag != "" {
 		perfSkip = strings.Split(*skipFlag, ",")
 	}
-
 	if *endpointsFlag != "" {
 		endpoints = strings.Split(*endpointsFlag, ",")
 	}
-
 	timeout = time.Duration(*timeoutFlag) * time.Second
+
+	// Initialize latency histograms for each operation type
+	operations := []string{"set", "set-large", "get", "delete", "has", "has-not", "mixed"}
+	for _, op := range operations {
+		latencyHistograms[op] = metrics.NewHistogram(metrics.NewExpDecaySample(1028, 0.015))
+	}
+}
+
+// measureLatency is a helper function that conditionally measures the latency of an operation
+func measureLatency(opName string, counter int, fn func() error) error {
+	// If sampling is disabled, just run the function
+	if perfSampleRate <= 0 {
+		return fn()
+	}
+
+	// Only sample a fraction of operations based on sample rate
+	if counter%perfSampleRate == 0 {
+		start := time.Now()
+		err := fn()
+		elapsed := time.Since(start)
+		if histogram, exists := latencyHistograms[opName]; exists {
+			histogram.Update(elapsed.Nanoseconds())
+		}
+		return err
+	}
+	return fn()
 }
 
 func main() {
 	fmt.Println("Performance testing tool for etcd servers")
-
 	// Print configuration
 	fmt.Println()
 	fmt.Println("Configuration:")
@@ -66,6 +91,11 @@ func main() {
 	fmt.Printf("Threads: %d\n", perfNumThreads)
 	fmt.Printf("Keys: %d\n", perfKeySpread)
 	fmt.Printf("Large value size: %d KB\n", perfLargeValueSizeKB)
+	if perfSampleRate > 0 {
+		fmt.Printf("Latency Sample Rate: 1/%d\n", perfSampleRate)
+	} else {
+		fmt.Println("Latency Sampling: disabled")
+	}
 	if len(perfSkip) > 0 {
 		fmt.Printf("Skipping tests: %s\n", strings.Join(perfSkip, ", "))
 	}
@@ -95,7 +125,6 @@ func main() {
 		if shouldSkip("set") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("set")
 		value := string(make([]byte, perfValueSizeBytes))
@@ -112,12 +141,14 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				_, err := etcdClient.Put(ctx, key, value)
+				err := measureLatency("set", counter, func() error {
+					_, err := etcdClient.Put(ctx, key, value)
+					return err
+				})
 				if err != nil {
 					log.Printf("(set) - error setting key: %v\n", err)
 				}
@@ -125,7 +156,6 @@ func main() {
 			}
 		})
 	})
-
 	results["set"] = setResult
 	printResult("set", setResult)
 
@@ -134,7 +164,6 @@ func main() {
 		if shouldSkip("set-large") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("set-large")
 		// Prepare large value
@@ -152,12 +181,14 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				_, err := etcdClient.Put(ctx, key, largeValue)
+				err := measureLatency("set-large", counter, func() error {
+					_, err := etcdClient.Put(ctx, key, largeValue)
+					return err
+				})
 				if err != nil {
 					log.Printf("(set-large) - error setting key: %v\n", err)
 				}
@@ -165,7 +196,6 @@ func main() {
 			}
 		})
 	})
-
 	results["set-large"] = setLargeValueResult
 	printResult("set-large", setLargeValueResult)
 
@@ -174,7 +204,6 @@ func main() {
 		if shouldSkip("get") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("get")
 		value := string(make([]byte, perfValueSizeBytes))
@@ -199,12 +228,14 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				_, err := etcdClient.Get(ctx, key)
+				err := measureLatency("get", counter, func() error {
+					_, err := etcdClient.Get(ctx, key)
+					return err
+				})
 				if err != nil {
 					log.Printf("(get) - error getting key: %v\n", err)
 				}
@@ -212,7 +243,6 @@ func main() {
 			}
 		})
 	})
-
 	results["get"] = getResult
 	printResult("get", getResult)
 
@@ -221,7 +251,6 @@ func main() {
 		if shouldSkip("delete") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("delete")
 		value := string(make([]byte, perfValueSizeBytes))
@@ -246,12 +275,14 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				_, err := etcdClient.Delete(ctx, key)
+				err := measureLatency("delete", counter, func() error {
+					_, err := etcdClient.Delete(ctx, key)
+					return err
+				})
 				if err != nil {
 					log.Printf("(delete) - error deleting key: %v\n", err)
 				}
@@ -259,7 +290,6 @@ func main() {
 			}
 		})
 	})
-
 	results["delete"] = deleteResult
 	printResult("delete", deleteResult)
 
@@ -268,7 +298,6 @@ func main() {
 		if shouldSkip("has") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("has")
 		value := string(make([]byte, perfValueSizeBytes))
@@ -293,22 +322,24 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				resp, err := etcdClient.Get(ctx, key)
+				err := measureLatency("has", counter, func() error {
+					resp, err := etcdClient.Get(ctx, key)
+					if err == nil {
+						_ = len(resp.Kvs) > 0 // This is the equivalent of "has" operation
+					}
+					return err
+				})
 				if err != nil {
 					log.Printf("(has) - error checking key: %v\n", err)
-				} else {
-					_ = len(resp.Kvs) > 0 // This is the equivalent of "has" operation
 				}
 				counter++
 			}
 		})
 	})
-
 	results["has"] = hasResult
 	printResult("has", hasResult)
 
@@ -317,25 +348,26 @@ func main() {
 		if shouldSkip("has-not") {
 			return
 		}
-
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := fmt.Sprintf("%s/has-not-%d", perfKeyPrefix, counter%100)
-				resp, err := etcdClient.Get(ctx, key)
+				err := measureLatency("has-not", counter, func() error {
+					resp, err := etcdClient.Get(ctx, key)
+					if err == nil {
+						_ = len(resp.Kvs) > 0 // This is the equivalent of "has" operation
+					}
+					return err
+				})
 				if err != nil {
 					log.Printf("(has-not) - error checking key: %v\n", err)
-				} else {
-					_ = len(resp.Kvs) > 0 // This is the equivalent of "has" operation
 				}
 				counter++
 			}
 		})
 	})
-
 	results["has-not"] = hasNotResult
 	printResult("has-not", hasNotResult)
 
@@ -344,7 +376,6 @@ func main() {
 		if shouldSkip("mixed") {
 			return
 		}
-
 		// Prepare keys
 		getKey, iter := getKeys("mixed")
 		value := string(make([]byte, perfValueSizeBytes))
@@ -373,41 +404,43 @@ func main() {
 
 		b.SetParallelism(perfNumThreads)
 		b.ResetTimer()
-
 		b.RunParallel(func(pb *testing.PB) {
 			counter := 0
 			for pb.Next() {
 				key := getKey(counter)
-				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				err := measureLatency("mixed", counter, func() error {
+					ctx, cancel := context.WithTimeout(context.Background(), timeout)
+					defer cancel()
 
-				var err error
-				switch counter % 5 {
-				case 0: // set
-					_, err = etcdClient.Put(ctx, key, value)
-				case 1: // get
-					_, err = etcdClient.Get(ctx, key)
-				case 2: // delete
-					_, err = etcdClient.Delete(ctx, key)
-				case 3: // has (implemented as Get)
-					resp, e := etcdClient.Get(ctx, key)
-					err = e
-					if err == nil {
-						_ = len(resp.Kvs) > 0
+					var err error
+					switch counter % 5 {
+					case 0: // set
+						_, err = etcdClient.Put(ctx, key, value)
+					case 1: // get
+						_, err = etcdClient.Get(ctx, key)
+					case 2: // delete
+						_, err = etcdClient.Delete(ctx, key)
+					case 3: // has (implemented as Get)
+						resp, e := etcdClient.Get(ctx, key)
+						err = e
+						if err == nil {
+							_ = len(resp.Kvs) > 0
+						}
+					case 4: // cas
+						// Get then compare-and-swap
+						getResp, e := etcdClient.Get(ctx, key)
+						err = e
+						if err == nil && len(getResp.Kvs) > 0 {
+							txn := etcdClient.Txn(ctx).
+								If(clientv3.Compare(clientv3.Value(key), "=", string(getResp.Kvs[0].Value))).
+								Then(clientv3.OpPut(key, "new-value")).
+								Else(clientv3.OpGet(key))
+							_, err = txn.Commit()
+						}
 					}
-				case 4: // cas
-					// Get then compare-and-swap
-					getResp, e := etcdClient.Get(ctx, key)
-					err = e
-					if err == nil && len(getResp.Kvs) > 0 {
-						txn := etcdClient.Txn(ctx).
-							If(clientv3.Compare(clientv3.Value(key), "=", string(getResp.Kvs[0].Value))).
-							Then(clientv3.OpPut(key, "new-value")).
-							Else(clientv3.OpGet(key))
-						_, err = txn.Commit()
-					}
-				}
+					return err
+				})
 
-				cancel()
 				if err != nil {
 					log.Printf("(mixed) - error performing operation (%d): %v\n", counter%5, err)
 				}
@@ -415,7 +448,6 @@ func main() {
 			}
 		})
 	})
-
 	results["mixed"] = mixedUsageResult
 	printResult("mixed", mixedUsageResult)
 
@@ -476,7 +508,19 @@ func printResult(test string, result testing.BenchmarkResult) {
 	opsPerSec := 1.0 / (nsPerOp / 1e9)
 
 	// Print the formatted result
-	fmt.Printf("%-20s%.0fns/op (%s/op)\t%.0f ops/sec\n", test, nsPerOp, time.Duration(nsPerOp), opsPerSec)
+	fmt.Printf("%-20s%.0fns/op (%s/op)\t%.0f ops/sec", test, nsPerOp, time.Duration(nsPerOp), opsPerSec)
+
+	// Add latency statistics if sampling is enabled
+	if perfSampleRate > 0 {
+		if histogram, exists := latencyHistograms[test]; exists && histogram.Count() > 0 {
+			p50 := time.Duration(histogram.Percentile(0.5))
+			p95 := time.Duration(histogram.Percentile(0.95))
+			p99 := time.Duration(histogram.Percentile(0.99))
+			fmt.Printf("\tLatency: p50=%s p95=%s p99=%s", p50, p95, p99)
+		}
+	}
+
+	fmt.Println()
 }
 
 // writeResultsToCSV writes benchmark results to a CSV file
@@ -495,6 +539,12 @@ func writeResultsToCSV(csvPath string, results map[string]testing.BenchmarkResul
 		"Test", "NsPerOp", "DurationPerOp", "OpsPerSec", "Skipped",
 		"Endpoints", "TimeoutSec", "Threads", "LargeValueSizeKB", "Keys Count",
 	}
+
+	// Add latency columns if sampling is enabled
+	if perfSampleRate > 0 {
+		header = append(header, "LatencyP50", "LatencyP95", "LatencyP99")
+	}
+
 	if err := writer.Write(header); err != nil {
 		return fmt.Errorf("failed to write CSV header: %v", err)
 	}
@@ -526,6 +576,18 @@ func writeResultsToCSV(csvPath string, results map[string]testing.BenchmarkResul
 			strconv.Itoa(perfNumThreads),
 			strconv.Itoa(perfLargeValueSizeKB),
 			strconv.Itoa(perfKeySpread),
+		}
+
+		// Add latency data if sampling is enabled
+		if perfSampleRate > 0 {
+			if histogram, exists := latencyHistograms[test]; exists && histogram.Count() > 0 {
+				p50 := time.Duration(histogram.Percentile(0.5)).String()
+				p95 := time.Duration(histogram.Percentile(0.95)).String()
+				p99 := time.Duration(histogram.Percentile(0.99)).String()
+				row = append(row, p50, p95, p99)
+			} else {
+				row = append(row, "N/A", "N/A", "N/A")
+			}
 		}
 
 		if err := writer.Write(row); err != nil {
